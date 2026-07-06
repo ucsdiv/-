@@ -29,8 +29,10 @@ PYTHON="python3"
 PIP="pip3"
 VERBOSE=false
 
-# 日志文件
-LOG_FILE="/tmp/deepseek_mobile_install.log"
+# 日志文件 (兼容 Termux，使用 $TMPDIR 或 $HOME)
+LOG_FILE="${TMPDIR:-${HOME}}/deepseek_mobile_install.log"
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
+touch "$LOG_FILE" 2>/dev/null || LOG_FILE="$HOME/deepseek_mobile_install.log"
 
 # ============================================================
 # 工具函数
