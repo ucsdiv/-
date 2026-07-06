@@ -166,12 +166,27 @@ install_system_deps() {
     case "$PLATFORM" in
         termux)
             pkg update -y 2>/dev/null || true
+            # Termux: 优先安装 Python 3.11/3.12 (PyTorch 不支持 3.14+)
+            local PYTHON_PKG="python"
+            # 检查是否有旧版 Python 包可用
+            local avail
+            for ver in "3.11" "3.12" "3.13"; do
+                avail=$(pkg search "python${ver}" 2>/dev/null | grep -c "python${ver}" || echo "0")
+                if [ "$avail" -gt 0 ]; then
+                    PYTHON_PKG="python${ver}"
+                    print_info "找到兼容 Python: $PYTHON_PKG"
+                    break
+                fi
+            done
             # 逐个安装，部分失败不影响整体
-            for pkg in python clang make git wget; do
-                pkg install -y "$pkg" 2>/dev/null && print_progress "  已安装: $pkg" || print_warn "  安装失败: $pkg (可手动安装)"
+            for pkg_name in "$PYTHON_PKG" clang make git wget; do
+                pkg install -y "$pkg_name" 2>/dev/null && print_progress "  已安装: $pkg_name" || print_warn "  安装失败: $pkg_name (可手动安装)"
             done
             # Termux python 包自带 pip
-            if command -v python &>/dev/null; then
+            if command -v python3 &>/dev/null; then
+                PYTHON="python3"
+                PIP="pip3"
+            elif command -v python &>/dev/null; then
                 PYTHON="python"
                 PIP="pip"
             fi
@@ -196,6 +211,40 @@ install_system_deps() {
             ;;
     esac
     print_step "系统依赖安装完成"
+}
+
+check_python_compat() {
+    # 检查 Python 版本兼容性
+    local py_version
+    py_version=$($PYTHON -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "0.0")
+    local py_major py_minor
+    py_major=$(echo "$py_version" | cut -d. -f1)
+    py_minor=$(echo "$py_version" | cut -d. -f2)
+
+    print_info "Python 版本: $py_version"
+
+    # PyTorch 支持到 Python 3.12，3.13 部分支持，3.14+ 不支持
+    if [ "$py_major" -ge 3 ] && [ "$py_minor" -ge 14 ]; then
+        print_warn "Python $py_version 太新，PyTorch 不兼容"
+        print_info "正在尝试安装兼容的 Python 版本..."
+
+        if [ "$PLATFORM" = "termux" ]; then
+            # 尝试安装旧版 Python
+            for ver in "3.12" "3.11" "3.10"; do
+                if pkg install -y "python${ver}" 2>/dev/null; then
+                    if command -v "python${ver}" &>/dev/null; then
+                        PYTHON="python${ver}"
+                        PIP="python${ver} -m pip"
+                        print_step "已安装兼容 Python: $PYTHON"
+                        return 0
+                    fi
+                fi
+            done
+            # 如果没有旧版包可用，尝试用 pip 安装 numpy 作为最小替代
+            print_warn "未找到兼容 Python 包，当前 Python 可能无法安装 PyTorch"
+            print_info "可尝试手动安装: pkg install python3.12"
+        fi
+    fi
 }
 
 detect_python() {
@@ -223,6 +272,9 @@ install_python_deps() {
 
     # 检测 Python
     detect_python
+
+    # 检查 Python 版本兼容性
+    check_python_compat
 
     # 尝试使用国内镜像加速
     local PIP_INDEX=""
