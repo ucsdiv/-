@@ -11,7 +11,7 @@
 # - 生成快捷启动脚本
 # ============================================================
 
-set -euo pipefail
+set -eo pipefail
 
 # 颜色定义
 RED='\033[0;31m'
@@ -97,10 +97,20 @@ check_memory() {
 
     local total_mem_kb
     total_mem_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+    if [ -z "$total_mem_kb" ]; then
+        print_warn "无法读取内存信息，使用默认配置"
+        MODEL_SIZE="small"
+        QUANT_BITS=4
+        return
+    fi
     local total_mem_mb=$((total_mem_kb / 1024))
-    local avail_mem_mb
-    avail_mem_mb=$(grep MemAvailable /proc/meminfo 2>/dev/null | awk '{print $2}')
-    avail_mem_mb=$((avail_mem_kb / 1024))
+
+    local avail_mem_kb
+    avail_mem_kb=$(grep MemAvailable /proc/meminfo 2>/dev/null | awk '{print $2}')
+    if [ -z "$avail_mem_kb" ]; then
+        avail_mem_kb=$((total_mem_kb / 2))
+    fi
+    local avail_mem_mb=$((avail_mem_kb / 1024))
 
     print_info "设备总内存: ${total_mem_mb} MB"
     print_info "可用内存: ${avail_mem_mb} MB"
@@ -131,16 +141,18 @@ check_memory() {
 
 check_storage() {
     local available_kb
-    available_kb=$(df "$HOME" 2>/dev/null | tail -1 | awk '{print $4}')
-    if [ -n "$available_kb" ]; then
+    available_kb=$(df "$HOME" 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'Kk' || echo "0")
+    if [ "$available_kb" -gt 0 ] 2>/dev/null; then
         local available_mb=$((available_kb / 1024))
         print_info "可用存储: ${available_mb} MB"
 
         if [ "$available_mb" -lt 1024 ]; then
-            die "存储空间不足 (需要至少 1GB)，请清理空间后重试"
+            print_warn "存储空间不足 1GB，安装可能失败"
         elif [ "$available_mb" -lt 2048 ]; then
             print_warn "存储空间较少 (<2GB)，建议清理缓存"
         fi
+    else
+        print_warn "无法检测存储空间"
     fi
 }
 
@@ -154,18 +166,21 @@ install_system_deps() {
     case "$PLATFORM" in
         termux)
             pkg update -y 2>/dev/null || true
-            pkg install -y python clang make git wget 2>/dev/null || {
-                print_error "依赖安装失败"
-                print_info "请手动运行: pkg install python clang make git wget"
-                return 1
-            }
+            # 逐个安装，部分失败不影响整体
+            for pkg in python clang make git wget; do
+                pkg install -y "$pkg" 2>/dev/null && print_progress "  已安装: $pkg" || print_warn "  安装失败: $pkg (可手动安装)"
+            done
+            # Termux python 包自带 pip
+            if command -v python &>/dev/null; then
+                PYTHON="python"
+                PIP="pip"
+            fi
             ;;
         ish)
             apk update 2>/dev/null || true
-            apk add python3 py3-pip python3-dev clang make git wget 2>/dev/null || {
-                print_error "依赖安装失败"
-                return 1
-            }
+            for pkg in python3 py3-pip python3-dev clang make git wget; do
+                apk add "$pkg" 2>/dev/null && print_progress "  已安装: $pkg" || print_warn "  安装失败: $pkg"
+            done
             ;;
         linux)
             if command -v apt &>/dev/null; then
@@ -183,43 +198,77 @@ install_system_deps() {
     print_step "系统依赖安装完成"
 }
 
+detect_python() {
+    if command -v python3 &>/dev/null; then
+        PYTHON="python3"
+    elif command -v python &>/dev/null; then
+        PYTHON="python"
+    else
+        die "未找到 Python，请先安装 Python"
+    fi
+
+    if command -v pip3 &>/dev/null; then
+        PIP="pip3"
+    elif command -v pip &>/dev/null; then
+        PIP="pip"
+    else
+        PIP="$PYTHON -m pip"
+    fi
+
+    print_info "Python: $($PYTHON --version 2>&1)"
+}
+
 install_python_deps() {
     print_progress "安装 Python 依赖..."
 
+    # 检测 Python
+    detect_python
+
     # 尝试使用国内镜像加速
     local PIP_INDEX=""
-    if curl -s --connect-timeout 3 https://pypi.org &>/dev/null; then
-        PIP_INDEX=""  # 官方源可访问
+    if command -v curl &>/dev/null; then
+        if curl -s --connect-timeout 3 https://pypi.org &>/dev/null; then
+            PIP_INDEX=""
+        else
+            PIP_INDEX="-i https://pypi.tuna.tsinghua.edu.cn/simple"
+            print_info "使用清华镜像源加速"
+        fi
     else
-        PIP_INDEX="-i https://pypi.tuna.tsinghua.edu.cn/simple"
-        print_info "使用清华镜像源加速"
+        print_warn "curl 未安装，使用默认源"
     fi
 
+    # 升级 pip
     $PIP install --upgrade pip $PIP_INDEX 2>/dev/null || true
 
-    # PyTorch (CPU 版)
+    # PyTorch
     print_progress "安装 PyTorch (CPU)..."
-    if [ "$PLATFORM" = "termux" ]; then
-        $PIP install torch $PIP_INDEX 2>/dev/null || {
-            print_warn "PyTorch 安装失败，尝试 numpy 替代"
-            $PIP install numpy $PIP_INDEX
-        }
+    local torch_installed=false
+    if $PIP install torch --extra-index-url https://download.pytorch.org/whl/cpu $PIP_INDEX 2>/dev/null; then
+        torch_installed=true
+    elif $PIP install torch $PIP_INDEX 2>/dev/null; then
+        torch_installed=true
     else
-        $PIP install torch --extra-index-url https://download.pytorch.org/whl/cpu $PIP_INDEX 2>/dev/null || {
-            print_warn "PyTorch CPU 源失败，尝试默认源"
-            $PIP install torch $PIP_INDEX 2>/dev/null || print_warn "PyTorch 安装失败"
-        }
+        print_warn "PyTorch pip 安装失败，尝试其他方式"
+        if [ "$PLATFORM" = "termux" ]; then
+            print_info "Termux 用户可尝试: pkg install python-numpy"
+        fi
+    fi
+    if $torch_installed; then
+        print_progress "  PyTorch 安装成功"
     fi
 
-    # transformers 和 tokenizers
-    $PIP install tokenizers $PIP_INDEX 2>/dev/null || print_warn "tokenizers 安装失败"
-    $PIP install transformers $PIP_INDEX 2>/dev/null || print_warn "transformers 安装失败"
+    # tokenizers
+    print_progress "安装 tokenizers..."
+    $PIP install tokenizers $PIP_INDEX 2>/dev/null && print_progress "  tokenizers 安装成功" || print_warn "  tokenizers 安装失败"
 
-    # 可选: psutil (内存监控)
+    # transformers
+    print_progress "安装 transformers..."
+    $PIP install transformers $PIP_INDEX 2>/dev/null && print_progress "  transformers 安装成功" || print_warn "  transformers 安装失败"
+
+    # 可选依赖
     $PIP install psutil $PIP_INDEX 2>/dev/null || true
-
-    # 可选: safetensors (量化保存)
     $PIP install safetensors $PIP_INDEX 2>/dev/null || true
+    $PIP install huggingface-hub $PIP_INDEX 2>/dev/null || true
 
     print_step "Python 依赖安装完成"
 }
@@ -499,9 +548,9 @@ main() {
     fi
 
     echo ""
-    install_system_deps   || die "系统依赖安装失败"
+    install_system_deps
     echo ""
-    install_python_deps   || die "Python 依赖安装失败"
+    install_python_deps
     echo ""
     setup_project         || die "项目部署失败"
     echo ""
@@ -515,10 +564,14 @@ main() {
     # 安装后验证
     echo -e "${CYAN}验证安装...${NC}"
     cd "$INSTALL_DIR"
+
+    # 重新检测 Python 路径
+    detect_python 2>/dev/null
+
     if $PYTHON -c "import torch; print(f'PyTorch: {torch.__version__}')" 2>/dev/null; then
         print_step "PyTorch 验证通过"
     else
-        print_warn "PyTorch 未正确安装"
+        print_warn "PyTorch 未正确安装，请手动安装"
     fi
 
     if $PYTHON -c "import tokenizers; print(f'tokenizers: {tokenizers.__version__}')" 2>/dev/null; then
